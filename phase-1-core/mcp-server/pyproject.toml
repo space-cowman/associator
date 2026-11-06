@@ -1,0 +1,24 @@
+# The MCP server package.
+[project]
+name = "platform-v2-mcp-server"
+version = "0.1.0"
+description = "platform-v2 MCP server: lets a user's own AI read threads, ask questions and submit drafts"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.3",
+    "httpx>=0.28",
+    "pydantic-settings>=2.6",
+    "uvicorn>=0.32",
+    "opentelemetry-distro==0.66b1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+    "opentelemetry-instrumentation-fastapi==0.66b1",
+    "opentelemetry-instrumentation-httpx==0.66b1",
+    "opentelemetry-instrumentation-logging==0.66b1",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "mcp_server"

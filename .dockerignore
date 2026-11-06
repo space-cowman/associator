@@ -1,0 +1,18 @@
+# Send Docker only what the images need.
+*
+!pyproject.toml
+!uv.lock
+!phase-1-core/api/pyproject.toml
+!phase-1-core/api/src
+!phase-1-core/safety/pyproject.toml
+!phase-1-core/safety/src
+!phase-1-core/llm-gateway/pyproject.toml
+!phase-1-core/llm-gateway/src
+!phase-2-agentic/orchestrator/pyproject.toml
+!phase-2-agentic/orchestrator/src
+!phase-1-core/mcp-server/pyproject.toml
+!phase-1-core/mcp-server/src
+!phase-1-core/web
+phase-1-core/web/node_modules
+phase-1-core/web/.next
+phase-1-core/web/tsconfig.tsbuildinfo

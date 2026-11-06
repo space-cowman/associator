@@ -1,0 +1,30 @@
+#!/bin/bash
+# EDGE / BACKEND node: joins the cluster as a k3s agent. Runs once at first boot, as root.
+# It holds no secrets except the cluster join token (read from Secrets Manager, never echoed).
+set -euo pipefail
+
+# 0. ECR credential provider: lets k3s pull private images from ECR with fresh logins
+#    (ECR logins expire after 12 h). k3s picks up this bin dir + config automatically.
+mkdir -p /var/lib/rancher/credentialprovider/bin
+curl -sfL -o /var/lib/rancher/credentialprovider/bin/ecr-credential-provider \
+  "https://artifacts.k8s.io/binaries/cloud-provider-aws/${ecr_cp_version}/linux/arm64/ecr-credential-provider-linux-arm64"
+echo "${ecr_cp_sha256}  /var/lib/rancher/credentialprovider/bin/ecr-credential-provider" | sha256sum -c -
+chmod 755 /var/lib/rancher/credentialprovider/bin/ecr-credential-provider
+cat > /var/lib/rancher/credentialprovider/config.yaml <<'CPEOF'
+apiVersion: kubelet.config.k8s.io/v1
+kind: CredentialProviderConfig
+providers:
+  - name: ecr-credential-provider
+    matchImages: ["*.dkr.ecr.*.amazonaws.com"]
+    defaultCacheDuration: "12h"
+    apiVersion: credentialprovider.kubelet.k8s.io/v1
+CPEOF
+
+# 1. k3s agent, installer pinned to the release tag. Joins the server on the data node (the agent
+#    keeps retrying until the server is up).
+K3S_TOKEN=$(aws secretsmanager get-secret-value --region "${region}" --secret-id "${cluster_secret_id}" \
+  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["k3s_token"])')
+export K3S_TOKEN K3S_URL="https://${server_ip}:6443"
+curl -sfL "https://raw.githubusercontent.com/k3s-io/k3s/${k3s_version}/install.sh" \
+  | INSTALL_K3S_VERSION="${k3s_version}" sh -s - agent --node-label platform/tier=${tier}${extra_args}
+unset K3S_TOKEN

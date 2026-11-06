@@ -1,0 +1,37 @@
+# Runs one OpenTelemetry Collector on the backend server.
+apiVersion: v1
+kind: Namespace
+metadata: {name: observability}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: otel-collector, namespace: observability, labels: {app: otel-collector}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: otel-collector}}
+  template:
+    metadata: {labels: {app: otel-collector}}
+    spec:
+      nodeSelector: {platform/tier: backend}
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.162.0
+          args: ["--config=/conf/collector.yaml"]
+          envFrom: [{secretRef: {name: grafana-otlp}}]
+          ports: [{name: grpc, containerPort: 4317}, {name: http, containerPort: 4318}]
+          resources: {requests: {cpu: 20m, memory: 64Mi}, limits: {memory: 160Mi}}
+          volumeMounts: [{name: conf, mountPath: /conf}]
+          livenessProbe: {httpGet: {path: /, port: 13133}, periodSeconds: 15}
+          readinessProbe: {httpGet: {path: /, port: 13133}, periodSeconds: 10}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}
+      volumes: [{name: conf, configMap: {name: otel-collector}}]
+      serviceAccountName: otel-collector
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 0, maxUnavailable: 1}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: otel-collector, namespace: observability}
+spec:
+  selector: {app: otel-collector}
+  ports: [{name: grpc, port: 4317, targetPort: grpc}, {name: http, port: 4318, targetPort: http}]

@@ -1,0 +1,151 @@
+# The orchestrator in Kubernetes. make orchestrator-deploy fills in the image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: ai
+  labels: {app: orchestrator}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: orchestrator}
+  template:
+    metadata:
+      labels: {app: orchestrator}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {platform/tier: backend}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: orchestrator
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8003}
+          env:
+            - {name: OTEL_SDK_DISABLED, value: "false"}
+            - {name: OTEL_SERVICE_NAME, value: "orchestrator"}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability:4318"}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: "60000"}
+            - {name: OTEL_PYTHON_FASTAPI_EXCLUDED_URLS, value: "healthz"}
+            - {name: OTEL_PYTHON_DISABLED_INSTRUMENTATIONS, value: "psycopg,redis"}
+            - {name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED, value: "true"}
+            - {name: OTEL_SEMCONV_STABILITY_OPT_IN, value: "http"}
+            - {name: LANGSMITH_TRACING, value: "false"}
+            - {name: LANGCHAIN_TRACING_V2, value: "false"}
+            - {name: GATEWAY_URL, value: "http://llm-gateway.ai.svc.cluster.local:4000"}
+            - {name: POSTGRES_HOST, value: "postgres.data.svc.cluster.local"}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: orchestrator-credentials, key: postgres-password}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: ai
+spec:
+  selector: {app: orchestrator}
+  ports:
+    - {name: http, port: 8003, targetPort: http}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator
+  namespace: ai
+spec:
+  podSelector: {matchLabels: {app: orchestrator}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: app}
+          podSelector:
+            matchLabels: {app: api}
+      ports:
+        - {port: 8003}
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app: llm-gateway}}
+      ports:
+        - {port: 4000}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: observability}
+      ports:
+        - {port: 4318, protocol: TCP}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: data}
+          podSelector:
+            matchLabels: {app: postgres}
+      ports:
+        - {port: 5432}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-gateway-from-orchestrator
+  namespace: ai
+spec:
+  podSelector: {matchLabels: {app: llm-gateway}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: orchestrator}}
+      ports:
+        - {port: 4000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator-to-postgres
+  namespace: data
+spec:
+  podSelector: {matchLabels: {app: postgres}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ai}
+          podSelector:
+            matchLabels: {app: orchestrator}
+      ports:
+        - {port: 5432}

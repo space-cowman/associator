@@ -1,0 +1,173 @@
+#!/bin/bash
+# DATA node (private subnet, no public IP). Runs once at first boot, as root.
+# k3s server (the cluster's control plane), Postgres and Redis. The edge and backend nodes join
+# it as agents. Pod traffic between nodes is encrypted (flannel WireGuard).
+set -euo pipefail
+
+# 0. ECR credential provider: lets k3s pull private images from ECR with fresh logins
+#    (ECR logins expire after 12 h). k3s picks up this bin dir + config automatically.
+mkdir -p /var/lib/rancher/credentialprovider/bin
+curl -sfL -o /var/lib/rancher/credentialprovider/bin/ecr-credential-provider \
+  "https://artifacts.k8s.io/binaries/cloud-provider-aws/${ecr_cp_version}/linux/arm64/ecr-credential-provider-linux-arm64"
+echo "${ecr_cp_sha256}  /var/lib/rancher/credentialprovider/bin/ecr-credential-provider" | sha256sum -c -
+chmod 755 /var/lib/rancher/credentialprovider/bin/ecr-credential-provider
+cat > /var/lib/rancher/credentialprovider/config.yaml <<'CPEOF'
+apiVersion: kubelet.config.k8s.io/v1
+kind: CredentialProviderConfig
+providers:
+  - name: ecr-credential-provider
+    matchImages: ["*.dkr.ecr.*.amazonaws.com"]
+    defaultCacheDuration: "12h"
+    apiVersion: credentialprovider.kubelet.k8s.io/v1
+CPEOF
+
+# 1. k3s server, installer pinned to the release tag. The join token comes from Secrets Manager
+#    (never echoed). Traefik is installed later, on the edge node only.
+K3S_TOKEN=$(aws secretsmanager get-secret-value --region "${region}" --secret-id "${cluster_secret_id}" \
+  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["k3s_token"])')
+export K3S_TOKEN
+curl -sfL "https://raw.githubusercontent.com/k3s-io/k3s/${k3s_version}/install.sh" \
+  | INSTALL_K3S_VERSION="${k3s_version}" sh -s - server \
+      --disable traefik --flannel-backend=wireguard-native --write-kubeconfig-mode 600 \
+      --node-label platform/tier=data --node-taint platform/tier=data:PreferNoSchedule
+unset K3S_TOKEN
+until /usr/local/bin/kubectl get nodes >/dev/null 2>&1; do sleep 5; done
+
+# 2. Passwords: Secrets Manager -> Kubernetes Secret. Never echoed (no `set -x`).
+SECRET=$(aws secretsmanager get-secret-value --region "${region}" --secret-id "${secret_id}" --query SecretString --output text)
+PG_ADMIN=$(printf '%s' "$SECRET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["postgres_admin_password"])')
+PG_OWNER=$(printf '%s' "$SECRET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["postgres_owner_password"])')
+PG_APP=$(printf '%s' "$SECRET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["postgres_app_password"])')
+REDIS_PASSWORD=$(printf '%s' "$SECRET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["redis_password"])')
+REDIS_ADMIN=$(printf '%s' "$SECRET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["redis_admin_password"])')
+/usr/local/bin/kubectl create namespace data --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -
+/usr/local/bin/kubectl -n data create secret generic database-credentials \
+  --from-literal=postgres-admin-password="$PG_ADMIN" --from-literal=postgres-owner-password="$PG_OWNER" \
+  --from-literal=postgres-app-password="$PG_APP" --from-literal=redis-password="$REDIS_PASSWORD" \
+  --from-literal=redis-admin-password="$REDIS_ADMIN" \
+  --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -
+unset SECRET PG_ADMIN PG_OWNER PG_APP REDIS_PASSWORD REDIS_ADMIN
+
+# 3. Postgres + Redis with fixed ClusterIPs.
+cat > /var/lib/rancher/k3s/server/manifests/data.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: postgres-init, namespace: data}
+data:
+  01-roles.sh: |
+    #!/bin/sh
+    # Runs once, on an empty data disk. Creates the owner and app roles (least privilege).
+    set -eu
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      -v owner_pw="$OWNER_PASSWORD" -v app_pw="$APP_PASSWORD" <<'SQL'
+    CREATE ROLE ${database_owner_user} LOGIN PASSWORD :'owner_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+    CREATE ROLE ${database_app_user} LOGIN PASSWORD :'app_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+
+    ALTER DATABASE ${database_name} OWNER TO ${database_owner_user};
+    REVOKE ALL ON DATABASE ${database_name} FROM PUBLIC;
+    GRANT CONNECT ON DATABASE ${database_name} TO ${database_app_user};
+
+    ALTER SCHEMA public OWNER TO ${database_owner_user};
+    REVOKE ALL ON SCHEMA public FROM PUBLIC;
+    GRANT USAGE ON SCHEMA public TO ${database_app_user};
+
+    -- Every table the owner creates later: the app may read and write rows, nothing more.
+    ALTER DEFAULT PRIVILEGES FOR ROLE ${database_owner_user} IN SCHEMA public
+      GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${database_app_user};
+    ALTER DEFAULT PRIVILEGES FOR ROLE ${database_owner_user} IN SCHEMA public
+      GRANT USAGE, SELECT ON SEQUENCES TO ${database_app_user};
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: data}
+spec:
+  clusterIP: ${postgres_cluster_ip}
+  selector: {app: postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres, namespace: data}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      nodeSelector: {platform/tier: data}
+      tolerations: [{key: platform/tier, value: data, effect: PreferNoSchedule}]
+      containers:
+        - name: postgres
+          image: ${postgres_image}
+          args: ["-c", "shared_buffers=128MB", "-c", "max_connections=50"]
+          env:
+            - {name: POSTGRES_USER, value: ${database_admin_user}}
+            - {name: POSTGRES_DB, value: ${database_name}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: database-credentials, key: postgres-admin-password}}
+            - name: OWNER_PASSWORD
+              valueFrom: {secretKeyRef: {name: database-credentials, key: postgres-owner-password}}
+            - name: APP_PASSWORD
+              valueFrom: {secretKeyRef: {name: database-credentials, key: postgres-app-password}}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "${database_admin_user}", "-d", "${database_name}"]}
+            periodSeconds: 10
+          resources: {requests: {memory: 256Mi, cpu: 100m}, limits: {memory: 768Mi}}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+      volumes:
+        - name: init
+          configMap: {name: postgres-init, defaultMode: 0555}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], storageClassName: local-path, resources: {requests: {storage: 10Gi}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: data}
+spec:
+  clusterIP: ${redis_cluster_ip}
+  selector: {app: redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: redis, namespace: data}
+spec:
+  serviceName: redis
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      nodeSelector: {platform/tier: data}
+      tolerations: [{key: platform/tier, value: data, effect: PreferNoSchedule}]
+      containers:
+        - name: redis
+          image: ${redis_image}
+          # ACL: default user off; app user may run everything except @dangerous
+          # (FLUSHALL, CONFIG, ACL, KEYS, DEBUG, SHUTDOWN, ...); admin user for emergencies.
+          command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction",
+                    "--user", "default", "off",
+                    "--user", "${redis_app_user}", "on", ">$(REDIS_PASSWORD)", "~*", "&*", "+@all", "-@dangerous",
+                    "--user", "${redis_admin_user}", "on", ">$(REDIS_ADMIN_PASSWORD)", "~*", "&*", "+@all"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: {secretKeyRef: {name: database-credentials, key: redis-password}}
+            - name: REDIS_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: database-credentials, key: redis-admin-password}}
+          ports: [{containerPort: 6379}]
+          readinessProbe:
+            exec: {command: ["sh", "-c", "REDISCLI_AUTH=$REDIS_PASSWORD redis-cli --user ${redis_app_user} ping"]}
+            periodSeconds: 10
+          resources: {requests: {memory: 64Mi, cpu: 50m}, limits: {memory: 192Mi}}
+          volumeMounts: [{name: data, mountPath: /data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], storageClassName: local-path, resources: {requests: {storage: 2Gi}}}
+EOF

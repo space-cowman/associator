@@ -1,0 +1,27 @@
+# The llm-gateway package.
+[project]
+name = "platform-v2-llm-gateway"
+version = "0.1.0"
+description = "platform-v2 llm-gateway: the single entry point to every model provider"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "pydantic-settings>=2.6",
+    "httpx>=0.28",
+    "openai>=3.38",
+    "boto3>=1.43",
+    "opentelemetry-distro==0.66b1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+    "opentelemetry-instrumentation-fastapi==0.66b1",
+    "opentelemetry-instrumentation-httpx==0.66b1",
+    "opentelemetry-instrumentation-logging==0.66b1",
+    "langsmith==0.14.11",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "gateway"

@@ -1,0 +1,124 @@
+# The api in Kubernetes. make api-deploy fills in the image.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: app
+  labels: {app: api}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: api}
+  template:
+    metadata:
+      labels: {app: api}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {platform/tier: backend}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: api
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8000}
+          env:
+            - {name: OTEL_SDK_DISABLED, value: "false"}
+            - {name: OTEL_SERVICE_NAME, value: "api"}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability:4318"}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: "60000"}
+            - {name: OTEL_PYTHON_FASTAPI_EXCLUDED_URLS, value: "healthz,readyz,chat/ws"}
+            - {name: OTEL_PYTHON_DISABLED_INSTRUMENTATIONS, value: "redis,psycopg"}
+            - {name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED, value: "true"}
+            - {name: OTEL_SEMCONV_STABILITY_OPT_IN, value: "http"}
+            - {name: DATABASE_URL, value: "postgresql+psycopg://platform_v2_app@postgres.data.svc.cluster.local:5432/platform_v2"}
+            - {name: REDIS_URL, value: "redis://platform_v2_app@redis.data.svc.cluster.local:6379/0"}
+            - {name: SAFETY_URL, value: "http://safety.ai.svc.cluster.local:8002"}
+            - {name: LLM_GATEWAY_URL, value: "http://llm-gateway.ai.svc.cluster.local:4000"}
+            - {name: ORCHESTRATOR_URL, value: "http://orchestrator.ai.svc.cluster.local:8003"}
+            - {name: ACTIVITY_METRICS, value: "true"}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: api-credentials, key: postgres-password}}
+            - name: REDIS_PASSWORD
+              valueFrom: {secretKeyRef: {name: api-credentials, key: redis-password}}
+            - name: JWT_SIGNING_KEY
+              valueFrom: {secretKeyRef: {name: api-credentials, key: jwt-signing-key}}
+            - name: IDENTITY_PEPPER
+              valueFrom: {secretKeyRef: {name: api-credentials, key: identity-pepper}}
+            - name: GITHUB_CLIENT_ID
+              valueFrom: {secretKeyRef: {name: api-oauth, key: github-client-id, optional: true}}
+            - name: GITHUB_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: api-oauth, key: github-client-secret, optional: true}}
+            - name: GOOGLE_CLIENT_ID
+              valueFrom: {secretKeyRef: {name: api-oauth, key: google-client-id, optional: true}}
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: api-oauth, key: google-client-secret, optional: true}}
+            - {name: PUBLIC_URL, value: "https://__DOMAIN__"}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: api-credentials, key: aws-access-key-id}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: api-credentials, key: aws-secret-access-key}}
+            - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+            - {name: USER_KEYS_KMS_ARN, value: "__KMS_ARN__"}
+            - {name: ATTACHMENTS_BUCKET, value: "__ATTACHMENTS_BUCKET__"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: app
+spec:
+  clusterIP: 10.43.0.60
+  selector: {app: api}
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app-only
+  namespace: data
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: app}
+      ports:
+        - {port: 5432}
+        - {port: 6379}

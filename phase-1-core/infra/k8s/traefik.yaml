@@ -1,0 +1,103 @@
+# Traefik, the only public entry (ports 80 and 443).
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  repo: https://traefik.github.io/charts
+  chart: traefik
+  version: 41.7.1
+  targetNamespace: kube-system
+  valuesContent: |-
+    service:
+      spec:
+        externalTrafficPolicy: Local   # keep the visitor's IP (for rate limits); one node anyway
+    nodeSelector: {platform/tier: edge}  # the public IP and ports 80/443 are on the edge node
+    updateStrategy:
+      type: Recreate          # one pod holds the certificate volume (ReadWriteOnce)
+    ingressRoute:
+      dashboard:
+        enabled: false
+    api:
+      dashboard: false
+    providers:
+      kubernetesCRD:
+        allowCrossNamespace: false
+      kubernetesIngress:
+        enabled: false        # routes are IngressRoutes only
+    ports:
+      web:
+        http:
+          redirections:
+            entryPoint: {to: websecure, scheme: https, permanent: true}
+      websecure:
+        http:
+          aliasHeadersStrategy: delete   # drop look-alike headers (X_Auth_User vs X-Auth-User)
+          tls:
+            enabled: true
+            certResolver: letsencrypt
+          middlewares:
+            - kube-system-security-headers@kubernetescrd
+    certificatesResolvers:
+      letsencrypt:
+        acme:
+          storage: /data/acme.json
+          httpChallenge:
+            entryPoint: web
+            delay: 30s          # let the new pod start receiving traffic before Let's Encrypt checks
+    persistence:
+      enabled: true
+      size: 128Mi
+      path: /data
+    deployment:
+      replicas: 1
+      # The certificate file holds the account's private key: Traefik refuses it unless it is 600.
+      initContainers:
+        - name: acme-permissions
+          image: busybox:1.37.0
+          command: ["sh", "-c", "touch /data/acme.json && chmod 600 /data/acme.json"]
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+    podSecurityContext:
+      runAsGroup: 65532
+      runAsNonRoot: true
+      runAsUser: 65532
+      seccompProfile: {type: RuntimeDefault}
+    # Telemetry: request counts / timings per route and a trace per request, to the OpenTelemetry
+    # Collector (it removes links, paths and visitors' addresses before anything leaves the cluster).
+    metrics:
+      otlp:
+        enabled: true
+        pushInterval: 60s
+        http:
+          enabled: true
+          endpoint: http://otel-collector.observability:4318/v1/metrics
+    tracing:
+      serviceName: traefik
+      sampleRate: 1.0
+      otlp:
+        enabled: true
+        http:
+          enabled: true
+          endpoint: http://otel-collector.observability:4318/v1/traces
+    accessLog:
+      enabled: true
+      fields:
+        headers:
+          defaultMode: drop     # never log cookies or Authorization headers
+        queryParameters:
+          defaultMode: drop     # nor query strings
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 160Mi}
+    global:
+      checkNewVersion: false
+      sendAnonymousUsage: false

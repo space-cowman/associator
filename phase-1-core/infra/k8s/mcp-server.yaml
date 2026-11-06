@@ -1,0 +1,101 @@
+# The MCP server in Kubernetes. make mcp-deploy fills in the image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+  namespace: app
+  labels: {app: mcp-server}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: mcp-server}
+  template:
+    metadata:
+      labels: {app: mcp-server}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {platform/tier: backend}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: mcp-server
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8001}
+          env:
+            - {name: OTEL_SDK_DISABLED, value: "false"}
+            - {name: OTEL_SERVICE_NAME, value: "mcp-server"}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability:4318"}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: "60000"}
+            - {name: OTEL_PYTHON_FASTAPI_EXCLUDED_URLS, value: "healthz,readyz,chat/ws"}
+            - {name: OTEL_PYTHON_DISABLED_INSTRUMENTATIONS, value: "redis,psycopg"}
+            - {name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED, value: "true"}
+            - {name: OTEL_SEMCONV_STABILITY_OPT_IN, value: "http"}
+            - {name: API_URL, value: "http://api.app.svc.cluster.local:8000"}
+            - name: ALLOWED_HOSTS
+              value: '["127.0.0.1:*", "localhost:*", "mcp-server.app.svc.cluster.local:*", "__DOMAIN__"]'
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server
+  namespace: app
+spec:
+  clusterIP: 10.43.0.61
+  selector: {app: mcp-server}
+  ports:
+    - {name: http, port: 8001, targetPort: http}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-server
+  namespace: app
+spec:
+  podSelector: {matchLabels: {app: mcp-server}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: observability}
+      ports:
+        - {port: 4318, protocol: TCP}
+    - to:
+        - podSelector: {matchLabels: {app: api}}
+      ports:
+        - {port: 8000}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}

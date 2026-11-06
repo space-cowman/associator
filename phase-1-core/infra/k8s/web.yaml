@@ -1,0 +1,74 @@
+# The web app in Kubernetes. make web-deploy fills in the image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: app
+  labels: {app: web}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {platform/tier: edge}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: web
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 3000}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 25m, memory: 96Mi}
+            limits: {memory: 256Mi}
+          livenessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: cache, mountPath: /app/.next/cache}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: cache
+          emptyDir: {sizeLimit: 64Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: app
+spec:
+  clusterIP: 10.43.0.62
+  selector: {app: web}
+  ports:
+    - {name: http, port: 3000, targetPort: http}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web
+  namespace: app
+spec:
+  podSelector: {matchLabels: {app: web}}
+  policyTypes: [Egress]
+  egress: []

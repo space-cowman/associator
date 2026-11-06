@@ -1,0 +1,93 @@
+# The nightly database backup job.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: data
+spec:
+  schedule: "30 20 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels: {app: postgres-backup}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          nodeSelector: {platform/tier: data}
+          tolerations: [{key: platform/tier, value: data, effect: PreferNoSchedule}]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile: {type: RuntimeDefault}
+          initContainers:
+            - name: dump
+              image: pgvector/pgvector:0.8.2-pg16
+              command: ["sh", "-c", "for i in $(seq 1 30); do pg_isready -q -h postgres.data.svc.cluster.local && break; sleep 2; done; pg_dump -h postgres.data.svc.cluster.local -U platform_v2_owner -d platform_v2 --exclude-schema=orchestrator -Fc -f /work/db.dump && test -s /work/db.dump"]
+              env:
+                - name: PGPASSWORD
+                  valueFrom: {secretKeyRef: {name: database-credentials, key: postgres-owner-password}}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {memory: 256Mi}
+              volumeMounts:
+                - {name: work, mountPath: /work}
+          containers:
+            - name: upload
+              image: amazon/aws-cli:2.17.0
+              command:
+                - sh
+                - -c
+                - |
+                  aws s3 cp /work/db.dump "s3://__BUCKET__/postgres/$(date -u +%Y-%m-%dT%H%M%SZ).dump" --sse AES256 --only-show-errors && echo uploaded || exit 1
+                  NOW=$(date +%s); NS=$(date +%s%N); SIZE=$(stat -c %s /work/db.dump)
+                  curl -sS -m 10 -o /dev/null -w "reported: HTTP %{http_code}\n" -H 'Content-Type: application/json' \
+                    http://otel-collector.observability.svc.cluster.local:4318/v1/metrics -d '{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"postgres-backup"}}]},"scopeMetrics":[{"scope":{"name":"associator.backup"},"metrics":[{"name":"associator.backup.last_success","unit":"s","gauge":{"dataPoints":[{"asInt":"'"$NOW"'","timeUnixNano":"'"$NS"'"}]}},{"name":"associator.backup.size","unit":"By","gauge":{"dataPoints":[{"asInt":"'"$SIZE"'","timeUnixNano":"'"$NS"'"}]}}]}]}]}' || true
+              env:
+                - {name: AWS_REGION, value: ap-south-1}
+                - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+                - {name: HOME, value: /tmp}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom: {secretKeyRef: {name: backup-credentials, key: aws-access-key-id}}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom: {secretKeyRef: {name: backup-credentials, key: aws-secret-access-key}}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {memory: 256Mi}
+              volumeMounts:
+                - {name: work, mountPath: /work, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: work
+              emptyDir: {sizeLimit: 2Gi}
+            - name: tmp
+              emptyDir: {sizeLimit: 64Mi}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backup-to-postgres
+  namespace: data
+spec:
+  podSelector: {matchLabels: {app: postgres}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: postgres-backup}}
+      ports:
+        - {port: 5432}

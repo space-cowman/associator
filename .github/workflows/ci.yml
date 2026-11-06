@@ -1,0 +1,120 @@
+# Lint, types, unit, web and database tests on every push.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  checks:
+    name: pre-commit, lint, types, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --all-packages
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: pre-commit (secrets, private keys, YAML, style)
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+      - run: make lint
+      - run: make typecheck
+      - name: unit tests (database tests run in the integration job)
+        run: uv run pytest
+
+  web:
+    name: web type-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: phase-1-core/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.22.1
+          cache: npm
+          cache-dependency-path: phase-1-core/web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc --noEmit
+
+  integration:
+    name: database tests (throwaway Postgres + Redis)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --all-packages
+      - name: Passwords for this run only
+        run: |
+          for v in ADMIN OWNER APP ORCH REDIS REDIS_ADMIN; do
+            p=$(openssl rand -hex 24); echo "::add-mask::$p"; echo "CI_${v}_PW=$p" >> "$GITHUB_ENV"
+          done
+      - name: Postgres (same image and roles as the data node)
+        run: |
+          docker run -d --name pg -p 127.0.0.1:15432:5432 -e POSTGRES_USER=platform_v2_admin \
+            -e POSTGRES_DB=platform_v2 -e POSTGRES_PASSWORD="$CI_ADMIN_PW" pgvector/pgvector:0.8.2-pg16
+          until docker exec pg pg_isready -h 127.0.0.1 -U platform_v2_admin -d platform_v2; do sleep 1; done
+          # Mirrors 01-roles.sh in infra/envs/beta/templates/data-server.sh.tftpl and orchestrator/scripts/db_role.py
+          docker exec -i pg psql -v ON_ERROR_STOP=1 -U platform_v2_admin -d platform_v2 \
+            -v owner_pw="$CI_OWNER_PW" -v app_pw="$CI_APP_PW" -v orch_pw="$CI_ORCH_PW" <<'SQL'
+          CREATE ROLE platform_v2_owner LOGIN PASSWORD :'owner_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+          CREATE ROLE platform_v2_app LOGIN PASSWORD :'app_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+          ALTER DATABASE platform_v2 OWNER TO platform_v2_owner;
+          REVOKE ALL ON DATABASE platform_v2 FROM PUBLIC;
+          GRANT CONNECT ON DATABASE platform_v2 TO platform_v2_app;
+          ALTER SCHEMA public OWNER TO platform_v2_owner;
+          REVOKE ALL ON SCHEMA public FROM PUBLIC;
+          GRANT USAGE ON SCHEMA public TO platform_v2_app;
+          ALTER DEFAULT PRIVILEGES FOR ROLE platform_v2_owner IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO platform_v2_app;
+          ALTER DEFAULT PRIVILEGES FOR ROLE platform_v2_owner IN SCHEMA public
+            GRANT USAGE, SELECT ON SEQUENCES TO platform_v2_app;
+          CREATE ROLE platform_v2_orchestrator LOGIN PASSWORD :'orch_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+          GRANT CONNECT ON DATABASE platform_v2 TO platform_v2_orchestrator;
+          CREATE SCHEMA orchestrator AUTHORIZATION platform_v2_orchestrator;
+          ALTER ROLE platform_v2_orchestrator IN DATABASE platform_v2 SET search_path = orchestrator;
+          SQL
+      - name: Redis (same image and ACL as the data node)
+        run: |
+          docker run -d --name redis -p 127.0.0.1:16379:6379 redis:7.2.16-alpine \
+            redis-server --user default off \
+            --user platform_v2_app on ">$CI_REDIS_PW" "~*" "&*" +@all -@dangerous \
+            --user platform_v2_admin on ">$CI_REDIS_ADMIN_PW" "~*" "&*" +@all
+          until docker exec -e REDISCLI_AUTH="$CI_REDIS_PW" redis redis-cli --user platform_v2_app ping; do sleep 1; done
+      - name: Migrations (as the owner, like make db-migrate)
+        run: uv run alembic -c phase-1-core/api/alembic.ini upgrade head
+        env:
+          PGPASSWORD: ${{ env.CI_OWNER_PW }}
+          DATABASE_URL: postgresql+psycopg://platform_v2_owner@127.0.0.1:15432/platform_v2
+      - name: Database tests (none may be skipped)
+        run: |
+          uv run pytest phase-1-core/api/tests phase-2-agentic/orchestrator/tests/test_runs.py -rs | tee pytest.out
+          ! grep -E '^SKIPPED' pytest.out
+        env:
+          PGPASSWORD: ${{ env.CI_APP_PW }}
+          REDIS_PASSWORD: ${{ env.CI_REDIS_PW }}
+          TEST_OWNER_PASSWORD: ${{ env.CI_OWNER_PW }}
+          TEST_ORCHESTRATOR_PASSWORD: ${{ env.CI_ORCH_PW }}

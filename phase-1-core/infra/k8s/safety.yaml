@@ -1,0 +1,121 @@
+# The safety service in Kubernetes. make safety-deploy fills in the image.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safety
+  namespace: ai
+  labels: {app: safety}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: safety}
+  template:
+    metadata:
+      labels: {app: safety}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {platform/tier: backend}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: safety
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: OTEL_SDK_DISABLED, value: "false"}
+            - {name: OTEL_SERVICE_NAME, value: "safety"}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability:4318"}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: "60000"}
+            - {name: OTEL_PYTHON_FASTAPI_EXCLUDED_URLS, value: "healthz,readyz,chat/ws"}
+            - {name: OTEL_PYTHON_DISABLED_INSTRUMENTATIONS, value: "redis,psycopg"}
+            - {name: OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED, value: "true"}
+            - {name: OTEL_SEMCONV_STABILITY_OPT_IN, value: "http"}
+          ports:
+            - {name: http, containerPort: 8002}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 50m, memory: 192Mi}
+            limits: {memory: 384Mi}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: safety
+  namespace: ai
+spec:
+  clusterIP: 10.43.0.70
+  selector: {app: safety}
+  ports:
+    - {name: http, port: 8002, targetPort: http}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: safety
+  namespace: ai
+spec:
+  podSelector: {matchLabels: {app: safety}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: app}
+      ports:
+        - {port: 8002}
+    - from:
+        - podSelector: {matchLabels: {app: llm-gateway}}
+      ports:
+        - {port: 8002}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: observability}
+      ports:
+        - {port: 4318, protocol: TCP}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - {port: 443, protocol: TCP}

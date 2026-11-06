@@ -1,0 +1,44 @@
+# The Python workspace, lint and test settings.
+[tool.uv.workspace]
+members = ["phase-1-core/api", "phase-1-core/safety", "phase-1-core/llm-gateway", "phase-1-core/mcp-server", "phase-2-agentic/orchestrator"]
+
+[tool.uv]
+constraint-dependencies = [
+    "jsonpatch<=1.36",
+    "jsonpointer<=3.4",
+    "langchain-core<=1.6.13",
+    "langgraph-sdk<=0.4.9",
+    "langgraph-checkpoint<=4.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=4",
+    "httpx>=0.28",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api", "safety", "gateway", "mcp_server", "orchestrator"]
+
+[tool.ruff.lint.per-file-ignores]
+"phase-1-core/tests/e2e/*" = ["S101", "S603", "S607"]
+"**/tests/**" = ["S101"]
+"phase-3-optimise/loadgen/*" = ["S311"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+addopts = "-q --import-mode=importlib --ignore=archive"
+pythonpath = ["phase-1-core/api/src", "phase-1-core/api", "phase-1-core/safety/src", "phase-1-core/llm-gateway/src", "phase-1-core/mcp-server/src", "phase-2-agentic/orchestrator/src"]
